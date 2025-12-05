@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Visualize non-AUTO ontology terms in a YAML extraction file.
+
+Counts all CURIE-style IDs like CHEBI:16526, NCBITaxon:2749268, etc.,
+excluding anything that starts with 'AUTO:'.
+
+Usage:
+    python scripts/visualize_non_auto_terms.py [input_yaml] [output_png]
+
+Defaults:
+    input_yaml  = chemical_utilization_cborg_gpt5_20250819_113045.yaml
+    output_png  = outputs/non_auto_ontology_term_distribution.png
+"""
+
+import sys
+import re
+from collections import Counter
+from pathlib import Path
+
+import yaml
+import matplotlib.pyplot as plt
+
+
+# Match CURIE-like IDs: PREFIX:VALUE (PREFIX all caps/digits/_)
+TERM_RE = re.compile(r'^[A-Z][A-Z0-9_]*:[^\s]+$')
+
+
+def collect_non_auto_terms(obj, terms):
+    """
+    Recursively walk an object and collect all non-AUTO CURIE-like strings.
+    """
+    if isinstance(obj, str):
+        # Skip AUTO: terms
+        if obj.startswith("AUTO:"):
+            return
+        # Match ontology-like IDs (CHEBI:16526, NCBITaxon:2749268, etc.)
+        if TERM_RE.match(obj):
+            terms.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            collect_non_auto_terms(v, terms)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            collect_non_auto_terms(v, terms)
+
+
+def extract_non_auto_terms(yaml_file):
+    """
+    Read a YAML file (possibly multi-doc) and return a list of non-AUTO ontology IDs.
+    """
+    all_terms = []
+
+    with open(yaml_file, "r", encoding="utf-8") as f:
+        # safe_load_all handles '---' separated docs
+        for doc in yaml.safe_load_all(f):
+            if doc is None:
+                continue
+            collect_non_auto_terms(doc, all_terms)
+
+    return all_terms
+
+
+def create_chart(term_counts, output_file):
+    """Create and save the bar chart."""
+    if not term_counts:
+        print("⚠️ No non-AUTO terms found; nothing to plot.")
+        return []
+
+    # Sort by count (most common first)
+    sorted_terms = term_counts.most_common()
+
+    labels = [t for (t, _) in sorted_terms]
+    counts = [c for (_, c) in sorted_terms]
+
+    plt.figure(figsize=(14, 8))
+    plt.bar(range(len(labels)), counts, color="#4B0082", edgecolor="#2E0854", linewidth=1.2)
+    plt.xticks(range(len(labels)), labels, rotation=45, ha="right", fontsize=18)
+    plt.ylabel("Count", fontsize=18, fontweight="bold")
+    plt.xlabel("Ontology ID (non-AUTO)", fontsize=18, fontweight="bold")
+    plt.title("Distribution of Non-AUTO Ontology Terms", fontsize=20, fontweight="bold")
+    plt.grid(axis="y", alpha=0.3, linestyle="--")
+
+    # Add count labels on top of bars
+    for i, c in enumerate(counts):
+        plt.text(i, c + 0.3, str(c), ha="center", va="bottom", fontsize=12, fontweight="bold")
+
+    plt.tight_layout()
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    print(f"✅ Chart saved to: {output_file}")
+
+    return sorted_terms
+
+
+def print_summary(term_counts):
+    """Print summary statistics."""
+    if not term_counts:
+        print("\nNo non-AUTO ontology terms found.")
+        return
+
+    sorted_terms = term_counts.most_common()
+
+    print("\nNon-AUTO Ontology Term Distribution:")
+    print("=" * 60)
+    for i, (term, count) in enumerate(sorted_terms, 1):
+        print(f"{i:2d}. {term:25s}: {count:3d}")
+    print("=" * 60)
+    print(f"\nTotal unique non-AUTO terms: {len(term_counts)}")
+    print(f"Total non-AUTO occurrences: {sum(term_counts.values())}")
+
+
+def main():
+    # Defaults – change these paths to your setup
+    default_input = "chemical_utilization_cborg_gpt5_20250819_113045.yaml"
+    default_output = "outputs/non_auto_ontology_term_distribution.png"
+
+    input_file = sys.argv[1] if len(sys.argv) > 1 else default_input
+    output_file = sys.argv[2] if len(sys.argv) > 2 else default_output
+
+    if not Path(input_file).exists():
+        print(f"❌ Error: Input file not found: {input_file}")
+        sys.exit(1)
+
+    print(f"📖 Reading YAML from: {input_file}")
+    terms = extract_non_auto_terms(input_file)
+
+    term_counts = Counter(terms)
+
+    print("📊 Creating chart...")
+    create_chart(term_counts, output_file)
+
+    print_summary(term_counts)
+
+
+if __name__ == "__main__":
+    main()

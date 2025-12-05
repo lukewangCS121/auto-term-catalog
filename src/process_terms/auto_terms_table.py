@@ -61,6 +61,35 @@ def extract_microbe_names(val: Any) -> List[str]:
     elif isinstance(val, str):
         names.append(val)
     return [n.strip() for n in names if n]
+PMID_KEYS = ("pmid",)
+
+def extract_pmids(obj: Any) -> str:
+    """
+    Finds values under keys like 'pmid' recursively.
+    """
+    pmids = set()
+
+    def walk(x: Any):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k.lower() in PMID_KEYS:
+                    # v is usually a string like '19622650'
+                    if isinstance(v, (list, tuple, set)):
+                        for vv in v:
+                            pmids.add(str(vv).strip())
+                    else:
+                        pmids.add(str(v).strip())
+                else:
+                    walk(v)
+        elif isinstance(x, (list, tuple, set)):
+            for v in x:
+                walk(v)
+
+    walk(obj)
+    pmids_clean = sorted(pmids)
+    return "; ".join(pmids_clean) if pmids_clean else ""
+
+
 
 def entity_contains_auto(ent: Dict[str, Any]) -> bool:
     def walk(x: Any) -> bool:
@@ -124,48 +153,136 @@ def infer_categories(ent: Dict[str, Any]) -> Dict[str, int]:
 
     return {"study_taxa": flag_taxa, "strains": flag_strain, "chemicals_mentioned": flag_chem}
 
+SPAN_PAIR_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+
+def extract_span_text_from_original(ent: Dict[str, Any], full_text: str, window: int = 50) -> str:
+    """
+    Use original_spans entries like '13:32' to slice substrings out of full_text.
+    Returns a '; ' joined string of context snippets around each span, e.g.:
+
+        "... some text [[actual span text]] some following text ..."
+    """
+    if not full_text:
+        return ""
+
+    spans = ent.get("original_spans")
+    if not spans:
+        return ""
+
+    # normalize to list
+    if isinstance(spans, str):
+        spans = [spans]
+
+    snippets = []
+    text_len = len(full_text)
+
+    for s in spans:
+        start = end = None
+
+        # Case 1: "13:32" style strings
+        if isinstance(s, str):
+            m = SPAN_PAIR_RE.match(s)
+            if m:
+                start = int(m.group(1))
+                end = int(m.group(2))
+
+        # Case 2: dict with numeric start/end
+        elif isinstance(s, dict):
+            if isinstance(s.get("start"), int) and isinstance(s.get("end"), int):
+                start = s["start"]
+                end = s["end"]
+
+        if start is None or end is None:
+            continue
+
+        # sanity clamp
+        if not (0 <= start < end <= text_len):
+            continue
+
+        try:
+            span_core = full_text[start:end]
+            if not span_core.strip():
+                continue
+
+            # context window
+            ctx_start = max(0, start - window)
+            ctx_end = min(text_len, end + window)
+
+            prefix = full_text[ctx_start:start]
+            suffix = full_text[end:ctx_end]
+
+            # add ellipses if we truncated
+            left_ellipsis = "..." if ctx_start > 0 else ""
+            right_ellipsis = "..." if ctx_end < text_len else ""
+
+            context_snippet = f"{left_ellipsis}{prefix}[[{span_core}]]{suffix}{right_ellipsis}"
+            snippets.append(context_snippet)
+        except Exception:
+            continue
+
+    return "; ".join(snippets)
+
+
 # ---------- main ----------
 def build_auto_tables(yaml_path: str) -> pd.DataFrame:
-    # collect entities
-    all_entities = []
-    for doc in iter_yaml_docs(yaml_path):
-        all_entities.extend(find_entities_like(doc))
-
-    # keep only AUTO entries
-    auto_entities = [e for e in all_entities if entity_contains_auto(e)]
-
-    # build rows
     rows = []
-    for e in auto_entities:
-        microbes = extract_microbe_names(e.get("study_taxa")) or ["UNKNOWN_MICROBE"]
-        flags = infer_categories(e)  # <-- guarantees 0/1
-        for microbe in microbes:
-            rows.append({
-                "microbe": microbe,
-                "id": e.get("id") or e.get("_id") or e.get("uuid"),
-                "label": e.get("label"),
-                "original_spans": normalize_spans(e.get("original_spans") or e.get("spans") or e.get("mentions")),
-                "study_taxa": flags["study_taxa"],
-                "strains": flags["strains"],
-                "chemicals_mentioned": flags["chemicals_mentioned"],
-            })
+
+    for doc in iter_yaml_docs(yaml_path):
+        # The original document string that original_spans indices refer to
+        full_text = (
+            doc.get("input_text")
+            or doc.get("text")
+            or doc.get("document_text")
+            or doc.get("raw_text")
+            or doc.get("source_text")
+            or ""
+        )
+
+        # PMIDs at the document level (pmid: '19622650')
+        doc_pmids = extract_pmids(doc)
+
+        # collect entities from this doc
+        entities = find_entities_like(doc)
+        auto_entities = [e for e in entities if entity_contains_auto(e)]
+
+        for e in auto_entities:
+            microbes = extract_microbe_names(e.get("study_taxa")) or ["UNKNOWN_MICROBE"]
+            flags = infer_categories(e)
+            pmids = extract_pmids(e) or doc_pmids
+
+            original = normalize_spans(
+                e.get("original_spans") or e.get("spans") or e.get("mentions")
+            )
+            # actual text of those character spans
+            span_text = extract_span_text_from_original(e, full_text)
+
+            for microbe in microbes:
+                rows.append({
+                    "microbe": microbe,
+                    "id": e.get("id") or e.get("_id") or e.get("uuid"),
+                    "label": e.get("label"),
+                    "original_spans": original,
+                    "span_text": span_text,
+                    "study_taxa": flags["study_taxa"],
+                    "strains": flags["strains"],
+                    "chemicals_mentioned": flags["chemicals_mentioned"],
+                    "pmids": pmids,
+                })
 
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        # Drop rows with no identifying fields at all
-        df = df.dropna(how="all", subset=["id","label","original_spans"])
-
-        # Deduplicate fully
+        # If you really want *zero* row loss, you can even comment this out temporarily
         df = df.drop_duplicates(subset=[
             "microbe","id","label","original_spans","study_taxa","strains","chemicals_mentioned"
         ])
 
-        # FINAL GUARANTEE: every flag is an explicit int 0/1
         for col in ["study_taxa","strains","chemicals_mentioned"]:
             df[col] = df[col].fillna(0).astype(int)
 
     return df
+
+
 
 # ---------- run ----------
 if __name__ == "__main__":
@@ -175,3 +292,4 @@ if __name__ == "__main__":
     print(df.head(15))
     df.to_csv("auto_terms_by_microbe_clean_inferred.csv", index=False)
     print("Saved auto_terms_by_microbe_clean_inferred.csv")
+    
