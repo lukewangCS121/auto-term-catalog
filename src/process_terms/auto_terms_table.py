@@ -289,7 +289,58 @@ if __name__ == "__main__":
     # set your YAML file path here (or wire up argparse)
     path = "/Users/lukewang/Downloads/chemical_utilization_cborg_gpt5_20250819_113045.yaml"
     df = build_auto_tables(path)
-    print(df.head(15))
-    df.to_csv("auto_terms_by_microbe_clean_inferred.csv", index=False)
-    print("Saved auto_terms_by_microbe_clean_inferred.csv")
-    
+    KG_NODES_TSV = "/Users/lukewang/Downloads/merged-kg/merged-kg_nodes.tsv"  # <-- change this
+
+# Load KG nodes
+nodes = pd.read_csv(KG_NODES_TSV, sep="\t", dtype=str).fillna("")
+
+# Identify the CURIE + label columns
+possible_id_cols = ["id"]
+possible_label_cols = ["label", "node_label", "name", "display_name"]
+
+kg_id_col = next(c for c in possible_id_cols if c in nodes.columns)
+kg_label_col = next(c for c in possible_label_cols if c in nodes.columns)
+
+# Build label → CURIE lookup
+label_to_curie = (
+    nodes[[kg_label_col, kg_id_col]]
+    .drop_duplicates()
+    .assign(_label_norm=lambda x: x[kg_label_col].str.strip().str.lower())
+    .set_index("_label_norm")[kg_id_col]
+    .to_dict()
+)
+
+def normalize_auto_label(label: str) -> str:
+    """Remove AUTO: prefix and normalize."""
+    if not isinstance(label, str):
+        return ""
+    label = label.strip()
+    if label.upper().startswith("AUTO:"):
+        label = label.split(":", 1)[1].strip()
+    return label.lower()
+
+# Match AUTO labels to KG CURIEs
+df["kg_id"] = df["label"].apply(
+    lambda x: label_to_curie.get(normalize_auto_label(x), "")
+)
+
+# Binary flag for whether the term exists in the KG
+df["in_kg"] = (df["kg_id"] != "").astype(int)
+
+# Optional: reorder columns
+desired_order = [
+    "microbe",
+    "id",
+    "label",
+    "kg_id",          # <-- CHEBI:xxxx etc
+    "in_kg",
+    "original_spans",
+    "study_taxa",
+    "strains",
+    "chemicals_mentioned",
+]
+df = df[[c for c in desired_order if c in df.columns]]
+
+# Save
+df.to_csv("auto_terms_by_microbe_with_kg_ids.csv", index=False)
+print("Saved auto_terms_by_microbe_with_kg_ids.csv")
