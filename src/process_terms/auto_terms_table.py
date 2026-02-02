@@ -327,6 +327,85 @@ df["kg_id"] = df["label"].apply(
 # Binary flag for whether the term exists in the KG
 df["in_kg"] = (df["kg_id"] != "").astype(int)
 
+CTX_STRAIN = re.compile(r"\b(strain|isolate|type strain|cultured|culture collection)\b", re.I)
+CTX_TAXA = re.compile(r"\b(genus|species|family|order|phylum|class|taxon)\b", re.I)
+CTX_CHEM = re.compile(r"\b(substrate|carbon source|electron donor|electron acceptor|metabolize|utili[sz]e|grown on|"
+                      r"mM|mmol|µM|uM|mg/L|g/L|w/v|v/v)\b", re.I)
+
+BINOMIAL_RE = re.compile(r"\b([A-Z][a-z]+)\s([a-z\-]{2,})\b")  # Genus species
+
+STRAIN_KEYS = re.compile(r"\b(DSM|ATCC|JCM|NRRL|NCIMB|KCTC|CGMCC|NBRC|BCRC|LMG|NCTC|KACC)\b")
+STRAIN_CODE = re.compile(r"\b([A-Z]{1,3}\d{2,}[A-Za-z0-9\-]*)\b")
+
+CHEM_KEYWORDS = re.compile(
+    r"\b(glucose|fructose|sucrose|lactose|xylose|arabinose|cellulose|xylan|lignin|glycerol|acetate|propionate|butyrate|"
+    r"lactate|pyruvate|succinate|citrate|ethanol|methanol|sulfate|sulphate|nitrate|nitrite|ammonium|ammonia|urea|H2|CO2|CH4)\b",
+    re.I
+)
+
+def infer_from_context(span_text: str, label: str = "", kg_id: str = ""):
+    """
+    Returns (taxa, strain, chem) as ints 0/1 using span_text context.
+    """
+    t = (span_text or "")
+    lab = (label or "")
+    curie = (kg_id or "")
+
+    text = f"{t} | {lab}".strip()
+
+    # 1) KG prefix overrides (strongest)
+    if curie.startswith("CHEBI:"):
+        return 0, 0, 1
+    if curie.startswith("NCBITaxon:"):
+        return 1, 0, 0
+
+    # 2) strain context
+    if CTX_STRAIN.search(text) or STRAIN_KEYS.search(text) or STRAIN_CODE.search(text):
+        # Strain mentions are usually strain category
+        return 0, 1, 0
+
+    # 3) taxa context (binomial is strong)
+    if BINOMIAL_RE.search(text) or CTX_TAXA.search(text):
+        return 1, 0, 0
+
+    # 4) chemical context
+    if CTX_CHEM.search(text) or CHEM_KEYWORDS.search(text):
+        return 0, 0, 1
+
+    # fallback
+    return 0, 0, 0
+
+# --- APPLY ONLY TO UNCATEGORIZED ROWS ---
+mask = (
+    (df["study_taxa"] == 0) &
+    (df["strains"] == 0) &
+    (df["chemicals_mentioned"] == 0)
+)
+
+# Make sure these exist (in case you reorder code)
+if "kg_id" not in df.columns:
+    df["kg_id"] = ""
+if "span_text" not in df.columns:
+    df["span_text"] = ""
+
+# Apply inference
+inferred = df.loc[mask, ["span_text", "label", "kg_id"]].apply(
+    lambda r: infer_from_context(r["span_text"], r["label"], r["kg_id"]),
+    axis=1,
+    result_type="expand"
+)
+inferred.columns = ["taxa2", "strain2", "chem2"]
+
+# Update flags (only for previously-uncategorized rows)
+df.loc[mask, "study_taxa"] = inferred["taxa2"].astype(int).values
+df.loc[mask, "strains"] = inferred["strain2"].astype(int).values
+df.loc[mask, "chemicals_mentioned"] = inferred["chem2"].astype(int).values
+
+df["uncategorized"] = (
+        (df["study_taxa"] == 0) &
+        (df["strains"] == 0) &
+        (df["chemicals_mentioned"] == 0)
+    ).astype(int)
 # Optional: reorder columns
 desired_order = [
     "microbe",
@@ -337,6 +416,7 @@ desired_order = [
     "original_spans",
     "study_taxa",
     "strains",
+    "uncategorized",
     "chemicals_mentioned",
 ]
 df = df[[c for c in desired_order if c in df.columns]]
