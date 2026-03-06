@@ -222,6 +222,109 @@ def extract_span_text_from_original(ent: Dict[str, Any], full_text: str, window:
 
     return "; ".join(snippets)
 
+def parse_raw_completion_output(raw_text: str) -> Dict[str, List[str]]:
+    """
+    Parse a block like:
+
+    pmid: none
+    study_taxa: Methylobacterium aquaticum
+    strains: 22A; AM1; C58
+    chemicals_mentioned: methanol; formaldehyde
+
+    Returns:
+        {
+            "study_taxa": [...],
+            "strains": [...],
+            "chemicals_mentioned": [...]
+        }
+    """
+    result = {
+        "study_taxa": [],
+        "strains": [],
+        "chemicals_mentioned": [],
+    }
+
+    if not raw_text or not isinstance(raw_text, str):
+        return result
+
+    current_key = None
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        lowered = line.lower()
+
+        if lowered.startswith("study_taxa:"):
+            current_key = "study_taxa"
+            value = line.split(":", 1)[1].strip()
+        elif lowered.startswith("strains:"):
+            current_key = "strains"
+            value = line.split(":", 1)[1].strip()
+        elif lowered.startswith("chemicals_mentioned:"):
+            current_key = "chemicals_mentioned"
+            value = line.split(":", 1)[1].strip()
+        elif ":" in line and lowered.split(":", 1)[0] in {"pmid"}:
+            current_key = None
+            continue
+        else:
+            # continuation line
+            if current_key is None:
+                continue
+            value = line
+
+        if value and value.lower() != "none":
+            pieces = [x.strip() for x in value.split(";") if x.strip()]
+            result[current_key].extend(pieces)
+
+    # dedupe while preserving order
+    for k in result:
+        seen = set()
+        deduped = []
+        for item in result[k]:
+            key = item.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        result[k] = deduped
+
+    return result
+def normalize_term(s: str) -> str:
+    """
+    Normalize terms for matching:
+    - lowercase
+    - remove AUTO: prefix
+    - collapse whitespace
+    """
+    if not isinstance(s, str):
+        return ""
+
+    s = s.strip()
+    if s.upper().startswith("AUTO:"):
+        s = s.split(":", 1)[1].strip()
+
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
+
+def build_normalized_term_set(items: List[str]) -> set:
+    return {normalize_term(x) for x in items if isinstance(x, str) and x.strip()}
+def infer_categories_from_raw_completion(ent: Dict[str, Any], raw_catalog: Dict[str, List[str]]) -> Dict[str, int]:
+    """
+    Categorize an AUTO term by checking whether its label appears in the
+    raw_completion_output lists for study_taxa / strains / chemicals_mentioned.
+    """
+    label = normalize_term(ent.get("label", ""))
+
+    taxa_terms = build_normalized_term_set(raw_catalog.get("study_taxa", []))
+    strain_terms = build_normalized_term_set(raw_catalog.get("strains", []))
+    chem_terms = build_normalized_term_set(raw_catalog.get("chemicals_mentioned", []))
+
+    return {
+        "study_taxa": int(label in taxa_terms),
+        "strains": int(label in strain_terms),
+        "chemicals_mentioned": int(label in chem_terms),
+    }
 
 # ---------- main ----------
 def build_auto_tables(yaml_path: str) -> pd.DataFrame:
@@ -241,13 +344,27 @@ def build_auto_tables(yaml_path: str) -> pd.DataFrame:
         # PMIDs at the document level (pmid: '19622650')
         doc_pmids = extract_pmids(doc)
 
+        # Parse raw_completion_output document-level categories
+        raw_completion_catalog = parse_raw_completion_output(
+            doc.get("raw_completion_output", "")
+        )
+
         # collect entities from this doc
         entities = find_entities_like(doc)
         auto_entities = [e for e in entities if entity_contains_auto(e)]
 
         for e in auto_entities:
             microbes = extract_microbe_names(e.get("study_taxa")) or ["UNKNOWN_MICROBE"]
-            flags = infer_categories(e)
+            # First pass: categorize using raw_completion_output lists
+            flags = infer_categories_from_raw_completion(e, raw_completion_catalog)
+
+            # Fallback: if still all zero, use your old heuristic logic
+            if (
+                flags["study_taxa"] == 0 and
+                flags["strains"] == 0 and
+                flags["chemicals_mentioned"] == 0
+            ):
+                flags = infer_categories(e)
             pmids = extract_pmids(e) or doc_pmids
 
             original = normalize_spans(
@@ -287,7 +404,7 @@ def build_auto_tables(yaml_path: str) -> pd.DataFrame:
 # ---------- run ----------
 if __name__ == "__main__":
     # set your YAML file path here (or wire up argparse)
-    path = "/Users/lukewang/Downloads/chemical_utilization_cborg_gpt5_20250819_113045.yaml"
+    path = "/Users/lukewang/Downloads/chemical_utilization_anthropic_claude-sonnet_20251031_190413.yaml"
     df = build_auto_tables(path)
     KG_NODES_TSV = "/Users/lukewang/Downloads/merged-kg/merged-kg_nodes.tsv"  # <-- change this
 
@@ -411,16 +528,18 @@ desired_order = [
     "microbe",
     "id",
     "label",
-    "kg_id",          # <-- CHEBI:xxxx etc
+    "kg_id",
     "in_kg",
     "original_spans",
+    "span_text",      # <-- add back
     "study_taxa",
     "strains",
-    "uncategorized",
     "chemicals_mentioned",
+    "uncategorized",
+    "pmids",          # <-- add back
 ]
 df = df[[c for c in desired_order if c in df.columns]]
 
 # Save
-df.to_csv("auto_terms_by_microbe_with_kg_ids.csv", index=False)
-print("Saved auto_terms_by_microbe_with_kg_ids.csv")
+df.to_csv("auto_terms_by_microbe_off_claude_20251031.csv", index=False)
+print("Saved auto_terms_by_microbe_off_claude_20251031.csv")
