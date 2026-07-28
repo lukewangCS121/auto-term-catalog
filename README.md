@@ -16,6 +16,7 @@ Requirements:
 - The directory of source abstracts, named like
   `00001-41779015-abstract.txt`
 - `merged-kg_nodes.tsv` and `merged-kg_edges.tsv`
+- `metpo.owl`
 
 Run:
 
@@ -25,6 +26,7 @@ Run:
   --documents-dir tmp/ijsem_first10_abstracts_with_pmids \
   --nodes /path/to/merged-kg_nodes.tsv \
   --edges /path/to/merged-kg_edges.tsv \
+  --metpo /path/to/metpo.owl \
   --output outputs/chemical_utilization_ijsem_first10_merged_kg_grounded.tsv
 ```
 
@@ -37,3 +39,13 @@ input files and the same command options, it produces byte-identical TSVs.
 The grounded TSV includes binary `chemicals_utilized`, `study_taxa`, and
 `strains` columns in addition to the selected ID, all candidate IDs, match
 type, KG category, edge count, and representative edge evidence.
+Chemical-utilization rows also include the relationship subject, extracted
+predicate, grounded METPO relationship ID, canonical METPO label, and match
+type. Generation fails if any extracted chemical relationship cannot be
+grounded to an object property in the supplied `metpo.owl`. Chemical mentions
+that do not participate in a `chemical_utilizations` relationship are omitted
+from the TSV. Within each abstract, duplicate entity and relationship rows are
+removed: study taxa and strains appear once, while chemical relationships are
+unique by subject, object, and predicate. The `original_spans` and `context`
+columns provide source-text evidence in the same `[[mention]]` style as
+`auto_terms_by_microbe_with_kg_match.csv`.

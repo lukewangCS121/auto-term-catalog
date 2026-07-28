@@ -17,12 +17,9 @@ import yaml
 FIELD_KINDS = {
     "study_taxa": "taxon_candidate",
     "strains": "strain",
-    "chemicals_mentioned": "chemical",
 }
-RELATION_FIELDS = {
-    "chemical_utilizations": ("chemical_utilization_subject", "strain", "chemical_utilization_object", "chemical"),
-    "strain_relationships": ("strain_relationship_subject", "strain", "strain_relationship_object", "taxon_candidate"),
-}
+STRAIN_OBJECT_PREDICATES = {"deposited_as", "identical_to"}
+SPAN_PATTERN = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +54,89 @@ def raw_values(raw_output: str, field: str) -> list[str]:
     return [value.strip() for value in match.group(1).split(";") if value.strip()]
 
 
+def normalized_spans(entity: dict[str, Any]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for span in entity.get("original_spans") or []:
+        if isinstance(span, str):
+            match = SPAN_PATTERN.match(span)
+            if match:
+                spans.append((int(match.group(1)), int(match.group(2))))
+        elif isinstance(span, dict):
+            start = span.get("start")
+            end = span.get("end")
+            if isinstance(start, int) and isinstance(end, int):
+                spans.append((start, end))
+    return spans
+
+
+def context_from_spans(
+    text: str,
+    spans: list[tuple[int, int]],
+    *,
+    related_label: str = "",
+    window: int = 50,
+) -> str:
+    snippets: list[str] = []
+    for start, end in spans:
+        if not 0 <= start < end <= len(text):
+            continue
+        context_start = max(0, start - window)
+        context_end = min(len(text), end + window)
+        prefix = text[context_start:start]
+        mention = text[start:end]
+        suffix = text[end:context_end]
+        snippet = (
+            ("..." if context_start else "")
+            + prefix
+            + f"[[{mention}]]"
+            + suffix
+            + ("..." if context_end < len(text) else "")
+        )
+        if related_label:
+            snippet = re.sub(
+                re.escape(related_label),
+                lambda match: f"[[{match.group(0)}]]",
+                snippet,
+                flags=re.IGNORECASE,
+            )
+        if snippet not in snippets:
+            snippets.append(snippet)
+    return "; ".join(snippets)
+
+
+def find_label_spans(text: str, label: str) -> list[tuple[int, int]]:
+    if not text or not label:
+        return []
+    exact = [
+        (match.start(), match.end())
+        for match in re.finditer(re.escape(label), text, flags=re.IGNORECASE)
+    ]
+    if exact:
+        return exact
+
+    flexible_pattern = re.escape(label).replace(r"\ ", r"\s+")
+    flexible_pattern = flexible_pattern.replace(r"\+", r"\s*\+")
+    flexible_pattern = flexible_pattern.replace(r"\-", r"\s*\-")
+    flexible = [
+        (match.start(), match.end())
+        for match in re.finditer(flexible_pattern, text, flags=re.IGNORECASE)
+    ]
+    if flexible:
+        return flexible
+
+    suffix = label.rsplit(maxsplit=1)[-1]
+    if len(suffix) >= 3 and any(character.isdigit() for character in suffix):
+        return [
+            (match.start(), match.end())
+            for match in re.finditer(
+                rf"(?<![A-Za-z0-9]){re.escape(suffix)}(?![A-Za-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    return []
+
+
 def main() -> None:
     args = parse_args()
     source_files = (
@@ -73,22 +153,57 @@ def main() -> None:
         if not isinstance(document, dict):
             continue
         extracted = document.get("extracted_object") or {}
-        entities = {
-            entity.get("id"): entity.get("label", "")
+        entity_records = {
+            entity.get("id"): entity
             for entity in document.get("named_entities") or []
             if isinstance(entity, dict) and entity.get("id")
         }
+        entities = {
+            entity_id: entity.get("label", "")
+            for entity_id, entity in entity_records.items()
+        }
         ids_by_label = {label.casefold(): entity_id for entity_id, label in entities.items() if label}
+        input_text = document.get("input_text") or ""
         source_file = source_files[doc_number - 1].name if doc_number <= len(source_files) else ""
         pmid_match = re.search(r"-(\d+)-abstract\.txt$", source_file)
         pmid = pmid_match.group(1) if pmid_match else ""
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str, str]] = set()
 
-        def add(field: str, kind: str, entity_id: str) -> None:
-            key = (field, entity_id)
+        def add(
+            field: str,
+            kind: str,
+            entity_id: str,
+            *,
+            relationship_subject_id: str = "",
+            chemical_relationship: str = "",
+        ) -> None:
+            key = (field, entity_id, relationship_subject_id, chemical_relationship)
             if key in seen:
                 return
             seen.add(key)
+            entity = entity_records.get(entity_id, {})
+            label = entities.get(entity_id, unquote(entity_id.removeprefix("AUTO:")))
+            spans = find_label_spans(input_text, label) or normalized_spans(entity)
+            relationship_subject_label = (
+                entities.get(
+                    relationship_subject_id,
+                    unquote(relationship_subject_id.removeprefix("AUTO:")),
+                )
+                if relationship_subject_id
+                else ""
+            )
+            context = context_from_spans(
+                input_text,
+                spans,
+                related_label=relationship_subject_label,
+            )
+            if not context:
+                spans = find_label_spans(input_text, label)
+                context = context_from_spans(
+                    input_text,
+                    spans,
+                    related_label=relationship_subject_label,
+                )
             rows.append(
                 {
                     "doc": str(doc_number),
@@ -97,7 +212,12 @@ def main() -> None:
                     "field": field,
                     "kind": kind,
                     "entity_id": entity_id,
-                    "label": entities.get(entity_id, unquote(entity_id.removeprefix("AUTO:"))),
+                    "label": label,
+                    "original_spans": "; ".join(f"{start}:{end}" for start, end in spans),
+                    "context": context,
+                    "relationship_subject_id": relationship_subject_id,
+                    "relationship_subject_label": relationship_subject_label,
+                    "chemical_relationship": chemical_relationship,
                 }
             )
 
@@ -108,17 +228,46 @@ def main() -> None:
                 entity_id = ids_by_label.get(label.casefold(), f"AUTO:{quote(label)}")
                 add(field, kind, entity_id)
 
-        for relation_field, (subject_field, subject_kind, object_field, object_kind) in RELATION_FIELDS.items():
-            for relation in extracted.get(relation_field) or []:
-                if not isinstance(relation, dict):
-                    continue
-                if isinstance(relation.get("subject"), str):
-                    add(subject_field, subject_kind, relation["subject"])
-                if isinstance(relation.get("object"), str):
-                    add(object_field, object_kind, relation["object"])
+        for relation in extracted.get("chemical_utilizations") or []:
+            if not isinstance(relation, dict) or not isinstance(relation.get("object"), str):
+                continue
+            add(
+                "chemical_utilization_object",
+                "chemical",
+                relation["object"],
+                relationship_subject_id=relation.get("subject", ""),
+                chemical_relationship=relation.get("predicate", ""),
+            )
+
+        for relation in extracted.get("strain_relationships") or []:
+            if not isinstance(relation, dict):
+                continue
+            subject = relation.get("subject")
+            obj = relation.get("object")
+            predicate = relation.get("predicate", "")
+            if isinstance(subject, str):
+                add("strains", "strain", subject)
+            if isinstance(obj, str):
+                if predicate in STRAIN_OBJECT_PREDICATES:
+                    add("strains", "strain", obj)
+                else:
+                    add("study_taxa", "taxon_candidate", obj)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["doc", "source_file", "pmid", "field", "kind", "entity_id", "label"]
+    fieldnames = [
+        "doc",
+        "source_file",
+        "pmid",
+        "field",
+        "kind",
+        "entity_id",
+        "label",
+        "original_spans",
+        "context",
+        "relationship_subject_id",
+        "relationship_subject_label",
+        "chemical_relationship",
+    ]
     with args.output.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(
             stream,

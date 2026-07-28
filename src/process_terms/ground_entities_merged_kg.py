@@ -7,6 +7,7 @@ import argparse
 import csv
 import re
 import unicodedata
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,11 @@ INDICATOR_FIELDS = {
 }
 DEFAULT_NODES = Path("/Users/lukewang/Downloads/merged-kg/merged-kg_nodes.tsv")
 DEFAULT_EDGES = Path("/Users/lukewang/Downloads/merged-kg/merged-kg_edges.tsv")
+METPO_IRI_PREFIX = "https://w3id.org/metpo/"
+RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
+OWL_OBJECT_PROPERTY = "{http://www.w3.org/2002/07/owl#}ObjectProperty"
+RDFS_LABEL = "{http://www.w3.org/2000/01/rdf-schema#}label"
+RELATED_SYNONYM = "{http://www.geneontology.org/formats/oboInOwl#}hasRelatedSynonym"
 
 
 @dataclass(frozen=True)
@@ -28,6 +34,13 @@ class Candidate:
     identifier: str
     name: str
     category: str
+    match_type: str
+
+
+@dataclass(frozen=True)
+class MetpoRelationship:
+    identifier: str
+    label: str
     match_type: str
 
 
@@ -62,7 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--nodes", default=DEFAULT_NODES, type=Path)
     parser.add_argument("--edges", default=DEFAULT_EDGES, type=Path)
+    parser.add_argument("--metpo", required=True, type=Path)
     parser.add_argument("--max-edge-evidence", default=5, type=int)
+    parser.add_argument(
+        "--strict-relationships",
+        action="store_true",
+        help="Fail if an extracted chemical relationship has no exact METPO label or synonym.",
+    )
     return parser.parse_args()
 
 
@@ -79,10 +98,65 @@ def candidate_rank(candidate: Candidate, entity_kind: str, edge_count: int) -> t
     )
 
 
+def load_metpo_relationships(path: Path) -> dict[str, list[MetpoRelationship]]:
+    label_matches: dict[str, list[MetpoRelationship]] = defaultdict(list)
+    synonym_matches: dict[str, list[MetpoRelationship]] = defaultdict(list)
+    root = ET.parse(path).getroot()
+
+    for element in root.iter(OWL_OBJECT_PROPERTY):
+        iri = element.get(RDF_ABOUT, "")
+        if not iri.startswith(METPO_IRI_PREFIX):
+            continue
+        identifier = f"METPO:{iri.removeprefix(METPO_IRI_PREFIX)}"
+        labels = [
+            child.text.strip()
+            for child in element.findall(RDFS_LABEL)
+            if child.text and child.text.strip()
+        ]
+        if not labels:
+            continue
+        label = labels[0]
+        for value in labels:
+            label_matches[normalize(value)].append(
+                MetpoRelationship(identifier, label, "label")
+            )
+        for child in element.findall(RELATED_SYNONYM):
+            if child.text and child.text.strip():
+                synonym_matches[normalize(child.text)].append(
+                    MetpoRelationship(identifier, label, "synonym")
+                )
+
+    matches = dict(synonym_matches)
+    matches.update(label_matches)
+    for key in matches:
+        matches[key] = sorted(
+            {match.identifier: match for match in matches[key]}.values(),
+            key=lambda match: match.identifier,
+        )
+    return matches
+
+
 def main() -> None:
     args = parse_args()
     with args.input.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream, delimiter="\t"))
+
+    metpo_relationships = load_metpo_relationships(args.metpo)
+    relationship_matches: dict[str, MetpoRelationship] = {}
+    missing_relationships: set[str] = set()
+    for row in rows:
+        relationship = row.get("chemical_relationship", "")
+        if not relationship:
+            continue
+        key = normalize(relationship.replace("_", " "))
+        candidates = metpo_relationships.get(key, [])
+        if candidates:
+            relationship_matches[relationship] = candidates[0]
+        else:
+            missing_relationships.add(relationship)
+    if args.strict_relationships and missing_relationships:
+        missing = ", ".join(sorted(missing_relationships))
+        raise ValueError(f"Chemical relationships not found in METPO: {missing}")
 
     wanted = {normalize(row.get("label", "")) for row in rows if row.get("label")}
     matches: dict[str, list[Candidate]] = defaultdict(list)
@@ -114,6 +188,11 @@ def main() -> None:
     output_fields = list(rows[0].keys()) if rows else ["doc", "field", "kind", "entity_id", "label"]
     output_fields += list(INDICATOR_FIELDS)
     output_fields += [
+        "chemical_relationship_id",
+        "chemical_relationship_label",
+        "chemical_relationship_match_type",
+    ]
+    output_fields += [
         "grounded_id",
         "grounded_ids",
         "kg_name",
@@ -141,6 +220,7 @@ def main() -> None:
             candidates = list({candidate.identifier: candidate for candidate in candidates}.values())
             candidates.sort(key=lambda candidate: candidate_rank(candidate, kind, edge_counts[candidate.identifier]))
             best = candidates[0] if candidates else None
+            relationship = relationship_matches.get(row.get("chemical_relationship", ""))
             writer.writerow(
                 {
                     **row,
@@ -148,6 +228,9 @@ def main() -> None:
                         indicator: "1" if row.get("field") == source_field else "0"
                         for indicator, source_field in INDICATOR_FIELDS.items()
                     },
+                    "chemical_relationship_id": relationship.identifier if relationship else "",
+                    "chemical_relationship_label": relationship.label if relationship else "",
+                    "chemical_relationship_match_type": relationship.match_type if relationship else "",
                     "grounded_id": best.identifier if best else "",
                     "grounded_ids": "|".join(candidate.identifier for candidate in candidates),
                     "kg_name": best.name if best else "",

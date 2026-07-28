@@ -20,6 +20,7 @@ Usage:
     --documents-dir PATH \
     --nodes PATH \
     --edges PATH \
+    --metpo PATH \
     --output PATH \
     [--entities-output PATH] \
     [--max-edge-evidence NUMBER]
@@ -30,6 +31,7 @@ Required inputs:
                   associated with YAML documents in bytewise filename order.
   --nodes          merged-kg_nodes.tsv.
   --edges          merged-kg_edges.tsv.
+  --metpo          METPO ontology in RDF/XML OWL format.
   --output         Destination grounded TSV.
 
 Optional:
@@ -44,6 +46,7 @@ EXTRACTION=""
 DOCUMENTS_DIR=""
 NODES=""
 EDGES=""
+METPO=""
 OUTPUT=""
 ENTITIES_OUTPUT=""
 MAX_EDGE_EVIDENCE=5
@@ -64,6 +67,10 @@ while (($#)); do
       ;;
     --edges)
       EDGES="${2:?missing value for --edges}"
+      shift 2
+      ;;
+    --metpo)
+      METPO="${2:?missing value for --metpo}"
       shift 2
       ;;
     --output)
@@ -90,7 +97,7 @@ while (($#)); do
   esac
 done
 
-for required in EXTRACTION DOCUMENTS_DIR NODES EDGES OUTPUT; do
+for required in EXTRACTION DOCUMENTS_DIR NODES EDGES METPO OUTPUT; do
   if [[ -z "${!required}" ]]; then
     echo "Missing required argument: ${required}" >&2
     usage >&2
@@ -102,6 +109,7 @@ done
 [[ -d "${DOCUMENTS_DIR}" ]] || { echo "Documents directory not found: ${DOCUMENTS_DIR}" >&2; exit 1; }
 [[ -f "${NODES}" ]] || { echo "Node file not found: ${NODES}" >&2; exit 1; }
 [[ -f "${EDGES}" ]] || { echo "Edge file not found: ${EDGES}" >&2; exit 1; }
+[[ -f "${METPO}" ]] || { echo "METPO file not found: ${METPO}" >&2; exit 1; }
 [[ "${MAX_EDGE_EVIDENCE}" =~ ^[0-9]+$ ]] || {
   echo "--max-edge-evidence must be a non-negative integer" >&2
   exit 2
@@ -128,7 +136,9 @@ python3 "${REPO_ROOT}/src/process_terms/ground_entities_merged_kg.py" \
   --input "${TMP_ENTITIES}" \
   --nodes "${NODES}" \
   --edges "${EDGES}" \
+  --metpo "${METPO}" \
   --max-edge-evidence "${MAX_EDGE_EVIDENCE}" \
+  --strict-relationships \
   --output "${TMP_OUTPUT}"
 
 chmod 0644 "${TMP_ENTITIES}" "${TMP_OUTPUT}"
