@@ -229,14 +229,22 @@ def main() -> None:
                 add(field, kind, entity_id)
 
         for relation in extracted.get("chemical_utilizations") or []:
-            if not isinstance(relation, dict) or not isinstance(relation.get("object"), str):
+            if not isinstance(relation, dict):
+                continue
+            subject = relation.get("subject")
+            predicate = relation.get("predicate")
+            obj = relation.get("object")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (subject, predicate, obj)
+            ):
                 continue
             add(
                 "chemical_utilization_object",
                 "chemical",
-                relation["object"],
-                relationship_subject_id=relation.get("subject", ""),
-                chemical_relationship=relation.get("predicate", ""),
+                obj,
+                relationship_subject_id=subject,
+                chemical_relationship=predicate,
             )
 
         for relation in extracted.get("strain_relationships") or []:
