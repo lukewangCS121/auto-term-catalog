@@ -7,6 +7,7 @@ import argparse
 import csv
 import os
 import re
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote, unquote
@@ -20,6 +21,55 @@ FIELD_KINDS = {
 }
 STRAIN_OBJECT_PREDICATES = {"deposited_as", "identical_to"}
 SPAN_PATTERN = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+
+
+def normalized_document_text(text: str) -> str:
+    """Normalize inconsequential file/YAML line-ending differences."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def documents_with_sources(
+    documents: list[Any], source_files: list[Path]
+) -> list[tuple[int, dict[str, Any], Path | None]]:
+    """Match extracted documents to source files by text, never directory order."""
+    if not source_files:
+        return [
+            (position, document, None)
+            for position, document in enumerate(documents, start=1)
+            if isinstance(document, dict)
+        ]
+
+    sources_by_text: dict[str, deque[Path]] = defaultdict(deque)
+    for source_file in source_files:
+        text = normalized_document_text(source_file.read_text(encoding="utf-8"))
+        sources_by_text[text].append(source_file)
+
+    matched: list[tuple[Path, dict[str, Any]]] = []
+    for yaml_position, document in enumerate(documents, start=1):
+        if not isinstance(document, dict):
+            continue
+        input_text = document.get("input_text")
+        if not isinstance(input_text, str):
+            raise ValueError(f"YAML document {yaml_position} has no input_text")
+        candidates = sources_by_text.get(normalized_document_text(input_text))
+        if not candidates:
+            raise ValueError(
+                f"YAML document {yaml_position} does not match any unused source file"
+            )
+        matched.append((candidates.popleft(), document))
+
+    unused = [path.name for candidates in sources_by_text.values() for path in candidates]
+    if unused:
+        raise ValueError(
+            f"{len(unused)} source file(s) were not matched to a YAML document: "
+            + ", ".join(sorted(unused)[:5])
+        )
+
+    matched.sort(key=lambda item: os.fsencode(item[0].name))
+    return [
+        (position, document, source_file)
+        for position, (source_file, document) in enumerate(matched, start=1)
+    ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,9 +199,9 @@ def main() -> None:
     with args.input.open(encoding="utf-8") as stream:
         documents = list(yaml.safe_load_all(stream))
 
-    for doc_number, document in enumerate(documents, start=1):
-        if not isinstance(document, dict):
-            continue
+    for doc_number, document, matched_source in documents_with_sources(
+        documents, source_files
+    ):
         extracted = document.get("extracted_object") or {}
         entity_records = {
             entity.get("id"): entity
@@ -164,7 +214,7 @@ def main() -> None:
         }
         ids_by_label = {label.casefold(): entity_id for entity_id, label in entities.items() if label}
         input_text = document.get("input_text") or ""
-        source_file = source_files[doc_number - 1].name if doc_number <= len(source_files) else ""
+        source_file = matched_source.name if matched_source else ""
         pmid_match = re.search(r"-(\d+)-abstract\.txt$", source_file)
         pmid = pmid_match.group(1) if pmid_match else ""
         seen: set[tuple[str, str, str, str]] = set()

@@ -35,6 +35,9 @@ Use `--entities-output PATH` to choose another location. The process fixes its
 locale, timezone, and Python hash seed; sorts source filenames bytewise; uses
 stable candidate ordering; and writes outputs atomically. Given byte-identical
 input files and the same command options, it produces byte-identical TSVs.
+Each YAML document is associated with its source filename and PMID by normalized
+full-text equality, so provenance remains correct even when OntoGPT returns
+directory inputs in filesystem order rather than filename order.
 
 The grounded TSV includes binary `chemicals_utilized`, `study_taxa`, and
 `strains` columns in addition to the selected ID, all candidate IDs, match
