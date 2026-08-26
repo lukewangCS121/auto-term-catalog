@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import os
 import re
 from collections import defaultdict, deque
@@ -80,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         "--documents-dir",
         type=Path,
         help="Optional input directory whose sorted filenames supply source file and PMID provenance.",
+    )
+    parser.add_argument(
+        "--max-documents",
+        type=int,
+        help="Process only the first N documents and source files in deterministic order.",
     )
     return parser.parse_args()
 
@@ -189,15 +195,24 @@ def find_label_spans(text: str, label: str) -> list[tuple[int, int]]:
 
 def main() -> None:
     args = parse_args()
+    if args.max_documents is not None and args.max_documents < 1:
+        raise ValueError("--max-documents must be a positive integer")
     source_files = (
         sorted(args.documents_dir.glob("*.txt"), key=lambda path: os.fsencode(path.name))
         if args.documents_dir
         else []
     )
+    if args.max_documents is not None:
+        source_files = source_files[: args.max_documents]
     rows: list[dict[str, str]] = []
 
     with args.input.open(encoding="utf-8") as stream:
-        documents = list(yaml.safe_load_all(stream))
+        loaded = yaml.safe_load_all(stream)
+        documents = list(
+            itertools.islice(loaded, args.max_documents)
+            if args.max_documents is not None
+            else loaded
+        )
 
     for doc_number, document, matched_source in documents_with_sources(
         documents, source_files
@@ -208,10 +223,16 @@ def main() -> None:
             for entity in document.get("named_entities") or []
             if isinstance(entity, dict) and entity.get("id")
         }
-        entities = {
-            entity_id: entity.get("label", "")
-            for entity_id, entity in entity_records.items()
-        }
+        entities = {}
+        for entity_id, entity in entity_records.items():
+            label = entity.get("label", "")
+            # PyYAML 1.1 coerces unquoted labels such as "on" to booleans.
+            # The AUTO identifier retains the original lexical value.
+            entities[entity_id] = (
+                label
+                if isinstance(label, str)
+                else unquote(entity_id.removeprefix("AUTO:"))
+            )
         ids_by_label = {label.casefold(): entity_id for entity_id, label in entities.items() if label}
         input_text = document.get("input_text") or ""
         source_file = matched_source.name if matched_source else ""

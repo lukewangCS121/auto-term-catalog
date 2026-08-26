@@ -23,6 +23,8 @@ Usage:
     --metpo PATH \
     --output PATH \
     [--entities-output PATH] \
+    [--max-documents NUMBER] \
+    [--expand-growth-conditions] \
     [--max-edge-evidence NUMBER]
 
 Required inputs:
@@ -37,6 +39,11 @@ Required inputs:
 Optional:
   --entities-output     Destination for the intermediate flattened entity TSV.
                         Defaults to OUTPUT with ".entities.tsv" appended.
+  --max-documents       Process only the first NUMBER extracted documents and
+                        source files in deterministic order.
+  --expand-growth-conditions
+                        Add source-grounded salinity, temperature, and pH
+                        ranges/growth values/optima after KG grounding.
   --max-edge-evidence  Maximum incident KG edges retained per grounded ID.
                         Defaults to 5.
 EOF
@@ -49,6 +56,8 @@ EDGES=""
 METPO=""
 OUTPUT=""
 ENTITIES_OUTPUT=""
+MAX_DOCUMENTS=""
+EXPAND_GROWTH_CONDITIONS=0
 MAX_EDGE_EVIDENCE=5
 
 while (($#)); do
@@ -80,6 +89,14 @@ while (($#)); do
     --entities-output)
       ENTITIES_OUTPUT="${2:?missing value for --entities-output}"
       shift 2
+      ;;
+    --max-documents)
+      MAX_DOCUMENTS="${2:?missing value for --max-documents}"
+      shift 2
+      ;;
+    --expand-growth-conditions)
+      EXPAND_GROWTH_CONDITIONS=1
+      shift
       ;;
     --max-edge-evidence)
       MAX_EDGE_EVIDENCE="${2:?missing value for --max-edge-evidence}"
@@ -114,6 +131,10 @@ done
   echo "--max-edge-evidence must be a non-negative integer" >&2
   exit 2
 }
+if [[ -n "${MAX_DOCUMENTS}" && ! "${MAX_DOCUMENTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--max-documents must be a positive integer" >&2
+  exit 2
+fi
 
 if [[ -z "${ENTITIES_OUTPUT}" ]]; then
   ENTITIES_OUTPUT="${OUTPUT%.tsv}.entities.tsv"
@@ -122,15 +143,21 @@ fi
 mkdir -p -- "$(dirname -- "${OUTPUT}")" "$(dirname -- "${ENTITIES_OUTPUT}")"
 TMP_ENTITIES="$(mktemp "${ENTITIES_OUTPUT}.tmp.XXXXXX")"
 TMP_OUTPUT="$(mktemp "${OUTPUT}.tmp.XXXXXX")"
+TMP_EXPANDED="$(mktemp "${OUTPUT}.expanded.tmp.XXXXXX")"
 cleanup() {
-  rm -f -- "${TMP_ENTITIES}" "${TMP_OUTPUT}"
+  rm -f -- "${TMP_ENTITIES}" "${TMP_OUTPUT}" "${TMP_EXPANDED}"
 }
 trap cleanup EXIT
 
-python3 "${REPO_ROOT}/src/process_terms/extract_grounding_entities.py" \
-  --input "${EXTRACTION}" \
-  --documents-dir "${DOCUMENTS_DIR}" \
+EXTRACT_ARGS=(
+  --input "${EXTRACTION}"
+  --documents-dir "${DOCUMENTS_DIR}"
   --output "${TMP_ENTITIES}"
+)
+if [[ -n "${MAX_DOCUMENTS}" ]]; then
+  EXTRACT_ARGS+=(--max-documents "${MAX_DOCUMENTS}")
+fi
+python3 "${REPO_ROOT}/src/process_terms/extract_grounding_entities.py" "${EXTRACT_ARGS[@]}"
 
 python3 "${REPO_ROOT}/src/process_terms/ground_entities_merged_kg.py" \
   --input "${TMP_ENTITIES}" \
@@ -141,9 +168,23 @@ python3 "${REPO_ROOT}/src/process_terms/ground_entities_merged_kg.py" \
   --strict-relationships \
   --output "${TMP_OUTPUT}"
 
+if ((EXPAND_GROWTH_CONDITIONS)); then
+  python3 "${REPO_ROOT}/scripts/expand_first100_chemical_levels.py" \
+    --input "${TMP_OUTPUT}" \
+    --documents-dir "${DOCUMENTS_DIR}" \
+    --nodes "${NODES}" \
+    --output "${TMP_EXPANDED}"
+  python3 "${REPO_ROOT}/scripts/expand_first100_environmental_observations.py" \
+    --input "${TMP_EXPANDED}" \
+    --documents-dir "${DOCUMENTS_DIR}" \
+    --nodes "${NODES}" \
+    --output "${TMP_OUTPUT}"
+fi
+
 chmod 0644 "${TMP_ENTITIES}" "${TMP_OUTPUT}"
 mv -f -- "${TMP_ENTITIES}" "${ENTITIES_OUTPUT}"
 mv -f -- "${TMP_OUTPUT}" "${OUTPUT}"
+rm -f -- "${TMP_EXPANDED}"
 
 trap - EXIT
 echo "Wrote entities: ${ENTITIES_OUTPUT}"

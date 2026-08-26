@@ -18,6 +18,9 @@ class Level(NamedTuple):
 
 
 LevelMap = dict[tuple[str, str, str], dict[str, list[Level]]]
+METPO_NACL_OPTIMUM = "METPO:2000507"
+METPO_NACL_GROWTH = "METPO:2000508"
+METPO_NACL_RANGE = "METPO:2000509"
 
 
 def level_annotations() -> LevelMap:
@@ -41,7 +44,6 @@ def level_annotations() -> LevelMap:
             }
 
     add(3, ["Ax23T"], "NaCl", [("3-6% NaCl", "3-6%")], [("optimum 3-4.5% NaCl", "3-4.5%")])
-    add(3, ["Ax23T"], "H2", [("10 kPa H2", "10 kPa"), ("160 kPa H2", "160 kPa")])
     add(6, ["JP12T"], "NaCl", [("0-0.5% NaCl", "0-0.5%")], [("best 0.25% (w/v) NaCl", "0.25%")])
     add(7, ["P3C3T"], "NaCl", [("0.5% (v/w) NaCl", "0.5%")], [("optimum 0.5% (v/w) NaCl", "0.5%")])
     add(7, ["MAC6T"], "NaCl", [("4.0% (v/w) NaCl", "4.0%")], [("optimum 4.0% (v/w) NaCl", "4.0%")])
@@ -88,11 +90,101 @@ def sentence_spans(text: str):
         yield start, text[start:]
 
 
+def is_range_level(display: str) -> bool:
+    """Return true for ranges and upper limits, excluding the hyphen in NaCl."""
+    return bool(
+        re.search(r"\bup to\b", display, re.IGNORECASE)
+        or re.search(
+            r"\d+(?:\.\d+)?\s*%?\s*(?:-|–|\bto\b)\s*\d+(?:\.\d+)?",
+            display,
+            re.IGNORECASE,
+        )
+    )
+
+
+SALT_LABELS = {"nacl", "sodium chloride", "sodium chloride (nacl)", "sea salt", "salt"}
+AMOUNT_PATTERN = re.compile(
+    r"(?P<amount>(?:\d+(?:\.\d+)?\s*%\s*(?:\([^)]*\)\s*)?"
+    r"(?:-|–|to)\s*\d+(?:\.\d+)?\s*%\s*(?:\([^)]*\))?|"
+    r"(?:up to\s+)?\d+(?:\.\d+)?"
+    r"(?:\s*(?:-|–|to)\s*\d+(?:\.\d+)?)?\s*"
+    r"(?:%\s*(?:\([^)]*\))?|mM\b|M\b|g\s*(?:l|L)[⁻\-−]?1|g\s*/\s*[lL])))",
+    re.IGNORECASE,
+)
+
+
+def automatic_levels(row: dict[str, str], text: str) -> dict[str, list[Level]] | None:
+    """Extract explicit NaCl/salt growth levels for documents after the audited prefix."""
+    if int(row["doc"]) <= 100 or row["label"].casefold() not in SALT_LABELS:
+        return None
+    chemical_terms = ["NaCl", "sodium chloride", "sea salt"]
+    if row["label"].casefold() == "salt":
+        chemical_terms.append("salt")
+    levels: dict[str, list[Level]] = {"concentration": [], "optimum": []}
+    candidates = []
+    for _, sentence in sentence_spans(text):
+        relevant = re.search(
+            r"\b(?:growth|grew|grow|grows|optimum|optimal|optima|tolerat|thrived)\b",
+            sentence,
+            re.IGNORECASE,
+        ) and any(re.search(re.escape(term), sentence, re.IGNORECASE) for term in chemical_terms)
+        if relevant:
+            candidates.append(sentence)
+    explicit = [
+        sentence
+        for sentence in candidates
+        if re.search(re.escape(row["relationship_subject_label"]), sentence, re.IGNORECASE)
+    ]
+    for sentence in explicit or candidates:
+        chemicals = [
+            match
+            for term in chemical_terms
+            for match in re.finditer(re.escape(term), sentence, re.IGNORECASE)
+        ]
+        if not chemicals:
+            continue
+        for amount in AMOUNT_PATTERN.finditer(sentence):
+            chemical = min(chemicals, key=lambda match: abs(match.start() - amount.start()))
+            if abs(chemical.start() - amount.start()) > 80:
+                continue
+            between = sentence[
+                min(amount.end(), chemical.end()) : max(amount.start(), chemical.start())
+            ]
+            if re.search(r"\b(?!NaCl\b)[A-Za-z0-9]+Cl\b", between, re.IGNORECASE):
+                continue
+            prefix = sentence[max(0, amount.start() - 28) : amount.start()]
+            optimum = bool(
+                re.search(
+                    r"(?:\(\s*(?:optimum|optimal|optima)[^()]*$|"
+                    r"\b(?:optimum|optimal|optima)(?:\s+(?:is|of|at))?[\s,:]*$)",
+                    prefix,
+                    re.IGNORECASE,
+                )
+            )
+            level_type = "optimum" if optimum else "concentration"
+            amount_text = re.sub(r"\s+", " ", amount.group("amount").strip())
+            display = (
+                f"optimum {amount_text} {row['label']}"
+                if optimum
+                else f"{amount_text} {row['label']}"
+            )
+            level = Level(display, amount.group("amount"))
+            if level not in levels[level_type]:
+                levels[level_type].append(level)
+    return levels if any(levels.values()) else None
+
+
 def evidence(row: dict[str, str], text: str, level: Level, level_type: str):
     base = row["label"]
     chemical_terms = [base]
-    if base.casefold() in {"nacl", "sodium chloride", "sodium chloride (nacl)"}:
-        chemical_terms = ["NaCl", "sodium chloride (NaCl)", "sodium chloride"]
+    if base.casefold() in SALT_LABELS:
+        chemical_terms = [
+            "NaCl",
+            "sodium chloride (NaCl)",
+            "sodium chloride",
+            "sea salt",
+            "salt",
+        ]
 
     candidates = []
     amount_pattern = re.escape(level.evidence)
@@ -135,16 +227,16 @@ def evidence(row: dict[str, str], text: str, level: Level, level_type: str):
 
     *_, sentence, amount, chemical = min(candidates, key=lambda item: item[:6])
     sentence_start = min(candidates, key=lambda item: item[:6])[3]
-    absolute_spans = sorted(
-        {
-            (sentence_start + amount.start(), sentence_start + amount.end()),
-            (sentence_start + chemical.start(), sentence_start + chemical.end()),
-        }
+    local_spans = sorted(
+        {(amount.start(), amount.end()), (chemical.start(), chemical.end())}
     )
+    if len(local_spans) == 2 and local_spans[1][0] <= local_spans[0][1]:
+        local_spans = [(local_spans[0][0], max(local_spans[0][1], local_spans[1][1]))]
+    absolute_spans = [
+        (sentence_start + start, sentence_start + end) for start, end in local_spans
+    ]
     highlighted = sentence
-    for start, end in sorted(
-        {(amount.start(), amount.end()), (chemical.start(), chemical.end())}, reverse=True
-    ):
+    for start, end in reversed(local_spans):
         highlighted = highlighted[:start] + "[[" + highlighted[start:end] + "]]" + highlighted[end:]
     return (
         "; ".join(f"{start}:{end}" for start, end in absolute_spans),
@@ -156,13 +248,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--documents-dir", required=True, type=Path)
+    parser.add_argument("--nodes", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
     with args.input.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream, delimiter="\t")
-        old_fields = reader.fieldnames or []
-        original_rows = list(reader)
+        existing_fields = reader.fieldnames or []
+        existing_rows = list(reader)
+    added_fields = {"chemical_level_type", "chemical_base_label", "chebi_label"}
+    old_fields = [field for field in existing_fields if field not in added_fields]
+    original_rows = [
+        {field: row.get(field, "") for field in old_fields}
+        for row in existing_rows
+        if row.get("chemical_level_type", "") not in {"concentration", "optimum"}
+    ]
     insert_at = old_fields.index("chemical_relationship") + 1
     new_fields = old_fields[:insert_at] + [
         "chemical_level_type",
@@ -171,6 +271,22 @@ def main() -> None:
     ] + old_fields[insert_at:]
 
     annotations = level_annotations()
+    wanted_metpo = {
+        METPO_NACL_OPTIMUM,
+        METPO_NACL_GROWTH,
+        METPO_NACL_RANGE,
+    }
+    metpo_labels = {}
+    with args.nodes.open(newline="", encoding="utf-8") as stream:
+        for node in csv.DictReader(stream, delimiter="\t"):
+            if node.get("id") in wanted_metpo:
+                metpo_labels[node["id"]] = node.get("name", "")
+    missing_metpo = wanted_metpo - set(metpo_labels)
+    if missing_metpo or any(not label for label in metpo_labels.values()):
+        raise ValueError(
+            "Required METPO terms are missing canonical KG-Microbe labels: "
+            + ", ".join(sorted(missing_metpo))
+        )
     salt_template = next(
         row for row in original_rows if row["grounded_id"] == "CHEBI:26710"
     )
@@ -180,6 +296,7 @@ def main() -> None:
     }
 
     matched = set()
+    generated_level_keys = set()
     output_rows = []
     for row in original_rows:
         relationship = row["field"] == "chemical_utilization_object"
@@ -188,6 +305,8 @@ def main() -> None:
         row["chebi_label"] = row["label"] if row["grounded_id"].startswith("CHEBI:") else ""
         key = (row["doc"], row["relationship_subject_label"], row["label"])
         annotation = annotations.get(key)
+        if annotation is None:
+            annotation = automatic_levels(row, texts[row["source_file"]])
         if annotation:
             matched.add(key)
             if row["label"].casefold() in {"nacl", "sodium chloride", "sodium chloride (nacl)"}:
@@ -213,9 +332,28 @@ def main() -> None:
                 variant["chebi_label"] = level.display
                 variant["kg_name"] = level.display
                 variant["match_type"] = f"context_{level_type}"
+                if level_type == "optimum":
+                    metpo_id = METPO_NACL_OPTIMUM
+                elif is_range_level(level.display):
+                    metpo_id = METPO_NACL_RANGE
+                else:
+                    metpo_id = METPO_NACL_GROWTH
+                variant["chemical_relationship"] = metpo_labels[metpo_id]
+                variant["chemical_relationship_id"] = metpo_id
+                variant["chemical_relationship_label"] = metpo_labels[metpo_id]
+                variant["chemical_relationship_match_type"] = "kg_microbe_metpo"
                 variant["original_spans"], variant["context"] = evidence(
                     row, texts[row["source_file"]], level, level_type
                 )
+                generated_key = (
+                    row["doc"],
+                    row["relationship_subject_id"],
+                    level_type,
+                    level.display.casefold(),
+                )
+                if generated_key in generated_level_keys:
+                    continue
+                generated_level_keys.add(generated_key)
                 output_rows.append(variant)
 
     missing = set(annotations) - matched

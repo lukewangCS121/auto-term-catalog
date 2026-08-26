@@ -52,3 +52,23 @@ removed: study taxa and strains appear once, while chemical relationships are
 unique by subject, object, and predicate. The `original_spans` and `context`
 columns provide source-text evidence in the same `[[mention]]` style as
 `auto_terms_by_microbe_with_kg_match.csv`.
+
+### First 1,000 abstracts with growth conditions
+
+The same command can deterministically select the first 1,000 extracted
+documents while matching each document to its PMID-labelled source by full
+text. `--expand-growth-conditions` adds source-grounded NaCl/salinity,
+temperature, and pH ranges, individual growth observations, and optima. The
+numeric observations use canonical KG-Microbe METPO predicates and classes.
+
+```bash
+./scripts/generate_merged_kg_grounded_tsv.sh \
+  --extraction outputs/chemical_utilization_ijsem_europepmc_abstracts_only_cborg_gpt41mini_no_grounding_refined_20260613.yaml \
+  --documents-dir tmp/ijsem_europepmc_abstract_txt \
+  --nodes /path/to/merged-kg_nodes.tsv \
+  --edges /path/to/merged-kg_edges.tsv \
+  --metpo /path/to/metpo.owl \
+  --max-documents 1000 \
+  --expand-growth-conditions \
+  --output outputs/chemical_utilization_ijsem_first1000_merged_kg_grounded.tsv
+```
